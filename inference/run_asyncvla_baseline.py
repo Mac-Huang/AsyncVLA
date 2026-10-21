@@ -16,6 +16,11 @@ sys.path.extend([
 import time, math, json
 import threading
 import argparse
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from edge_timing import (
+    EdgeStageTimer, execution_context, observe_benchmark,
+    cpu_snapshot, cpu_counter_delta,
+)
 import yaml
 from typing import Optional, Tuple, Type, Dict
 from dataclasses import dataclass
@@ -682,21 +687,50 @@ class BaseVLM(nn.Module):
 class EdgeAdaptor(nn.Module):
     """Raw current/past images and base tokens -> action-head deltas."""
 
-    def __init__(self, shead, device):
+    def __init__(self, shead, device, profile=False):
         super().__init__()
         self.shead = shead
         self.device = device
+        self.stage_timer = EdgeStageTimer(shead, device) if profile else None
 
-    def prepare_image(self, image):
-        small = TF.resize(to_tensor(resize_rgb(image)), (96, 96)).unsqueeze(0)
-        return transform(small).to(device=self.device, dtype=torch.bfloat16)
+    def prepare_image(self, image, name):
+        if self.stage_timer is None:
+            small = TF.resize(to_tensor(resize_rgb(image)), (96, 96)).unsqueeze(0)
+            return transform(small).to(device=self.device, dtype=torch.bfloat16)
+
+        timer = self.stage_timer
+        image = timer.cpu_call(name + ".resize224", lambda: resize_rgb(image))
+        tensor = timer.cpu_call(name + ".to_tensor", lambda: to_tensor(image))
+        small = timer.cpu_call(
+            name + ".resize96",
+            lambda: TF.resize(tensor, (96, 96)).unsqueeze(0),
+        )
+        normalized = timer.cpu_call(name + ".normalize", lambda: transform(small))
+        return timer.transfer(
+            name + ".h2d_bf16",
+            lambda: normalized.to(device=self.device, dtype=torch.bfloat16),
+        )
 
     @torch.no_grad()
     def forward(self, current_image, past_image, base_tokens):
         # Both EfficientNets execute inside shead on every call.
-        img_cur = self.prepare_image(current_image)
-        img_past = self.prepare_image(past_image)
-        return self.shead(img_cur, img_past, base_tokens)
+        timer = self.stage_timer
+        if timer is not None:
+            timer.begin()
+        try:
+            img_cur = self.prepare_image(current_image, "current")
+            img_past = self.prepare_image(past_image, "past")
+            if timer is None:
+                return self.shead(img_cur, img_past, base_tokens)
+            return timer.cpu_call(
+                "shead_dispatch",
+                lambda: self.shead(img_cur, img_past, base_tokens),
+            )
+        except Exception:
+            if timer is not None:
+                timer.abort()
+            raise
+
 
 def run_base(base, raw):
     return base(raw)
@@ -706,20 +740,41 @@ def run_edge(edge, raw, base_tokens):
     return edge(raw["current_image"], raw["base_image"], base_tokens)
 
 
-def finish_robot_command(delta_actions, inference):
+def finish_robot_command(delta_actions, inference, profile=None):
+    if profile is None:
+        trajectory = delta_to_pose(delta_actions)
+        return inference.pd_controller(trajectory.cpu(), metric_waypoint_spacing=0.1)
+    start = time.perf_counter_ns()
     trajectory = delta_to_pose(delta_actions)
-    return inference.pd_controller(trajectory.cpu(), metric_waypoint_spacing=0.1)
+    after_pose = time.perf_counter_ns()
+    trajectory_cpu = trajectory.cpu()
+    after_copy = time.perf_counter_ns()
+    command = inference.pd_controller(trajectory_cpu, metric_waypoint_spacing=0.1)
+    finish = time.perf_counter_ns()
+    profile.update({
+        "delta_to_pose_dispatch_ms": (after_pose - start) / 1e6,
+        "trajectory_to_cpu_wall_ms": (after_copy - after_pose) / 1e6,
+        "pd_controller_cpu_ms": (finish - after_copy) / 1e6,
+    })
+    return command
 
 
-def measure_call(fn, device):
+def measure_call(fn, device, record_wait=False):
     # Measure execution latency for run_base/run_edge.
     torch.cuda.synchronize(device)
     start_ns = time.perf_counter_ns()
     result = fn()
+    dispatched_ns = time.perf_counter_ns() if record_wait else None
     torch.cuda.synchronize(device)
     end_ns = time.perf_counter_ns()
-    return result, {"start_ns": start_ns, "end_ns": end_ns,
-                    "latency_ms": (end_ns - start_ns) / 1e6}
+    record = {
+        "start_ns": start_ns, "end_ns": end_ns,
+        "latency_ms": (end_ns - start_ns) / 1e6,
+    }
+    if record_wait:
+        record["completion_wait_ms"] = (end_ns - dispatched_ns) / 1e6
+    return result, record
+
 
 def measure_e2e(base, edge, raw, inference, device):
     # Four boundaries produce three consecutive timing records.
@@ -756,13 +811,23 @@ def call_timing(call_id, start_ns, finish_ns, origin_ns):
     }
 
 
+def add_edge_profile(edge, record, wait_ms, command_profile):
+    if edge.stage_timer is not None:
+        profile = edge.stage_timer.collect()
+        profile["completion_wait_ms"] = wait_ms
+        record["edge_profile"] = profile
+        record["command_profile"] = command_profile
+
+
 def run_isolated_benchmark(
     base, edge, raw, inference, device, repeats=100, warmup=10,
+    fixed_tokens=None,
 ):
     if repeats <= 0 or warmup < 0:
         raise ValueError("repeats must be positive and warmup must be nonnegative.")
 
     base_records, edge_records = [], []
+    profiled = edge.stage_timer is not None
     with torch.cuda.device(device), torch.no_grad():
         for _ in range(warmup):
             run_base(base, raw)
@@ -776,25 +841,28 @@ def run_isolated_benchmark(
                 call_id, timing["start_ns"], timing["end_ns"], origin_ns,
             ))
 
-        # Use the last completed base result as a fixed edge input.
+        edge_tokens = tokens if fixed_tokens is None else fixed_tokens
         for _ in range(warmup):
-            deltas = run_edge(edge, raw, tokens)
+            deltas = run_edge(edge, raw, edge_tokens)
             finish_robot_command(deltas, inference)
         torch.cuda.synchronize(device)
+        context = execution_context(device) if profiled else None
 
         # BaseVLM stays idle throughout this phase.
         for call_id in range(repeats):
             deltas, timing = measure_call(
-                lambda: run_edge(edge, raw, tokens), device,
+                lambda: run_edge(edge, raw, edge_tokens), device,
+                record_wait=profiled,
             )
-            command = finish_robot_command(deltas, inference)
+            command_profile = {} if profiled else None
+            command = finish_robot_command(deltas, inference, command_profile)
             torch.cuda.synchronize(device)
             command_finish_ns = time.perf_counter_ns()
             record = call_timing(
                 call_id, timing["start_ns"], timing["end_ns"], origin_ns,
             )
             record.update({
-                "base_id": base_records[-1]["call_id"],
+                "base_id": base_records[-1]["call_id"] if fixed_tokens is None else -1,
                 "command_finish_ns": command_finish_ns,
                 "command_finish_ms": (command_finish_ns - origin_ns) / 1e6,
                 "framework_ms": (command_finish_ns - timing["end_ns"]) / 1e6,
@@ -804,24 +872,37 @@ def run_isolated_benchmark(
                 "linear_velocity": float(command[0]),
                 "angular_velocity": float(command[1]),
             })
+            add_edge_profile(
+                edge, record, timing.get("completion_wait_ms", 0.0),
+                command_profile,
+            )
             edge_records.append(record)
 
-    return {
+    result = {
         "origin_ns": origin_ns,
         "base_calls": base_records,
         "edge_calls": edge_records,
     }
+    if context is not None:
+        result["execution_context"] = {"main": context}
+        result["edge_cpu_cgroup_delta"] = cpu_counter_delta(
+            context["cpu_cgroup"], cpu_snapshot(),
+        )
+    if fixed_tokens is not None:
+        result["token_policy"] = "fixed_fixture"
+    return result
 
 
 def run_async_benchmark(
     base, edge, raw, inference, device, duration_s=30.0, warmup=10,
+    base_enabled=True, fixed_tokens=None, cpu_threads=None,
 ):
     if duration_s <= 0 or warmup < 0:
         raise ValueError("duration_s must be positive and warmup must be nonnegative.")
 
-    # Prepare tokens for edge warmup only.
+    # Prepare tokens for warmup, or use the shared diagnostic fixture.
     with torch.cuda.device(device), torch.no_grad():
-        seed_tokens = run_base(base, raw)
+        seed_tokens = run_base(base, raw) if fixed_tokens is None else fixed_tokens
         torch.cuda.synchronize(device)
 
     base_stream = torch.cuda.Stream(device=device)
@@ -829,10 +910,17 @@ def run_async_benchmark(
     condition = threading.Condition()
     stop = threading.Event()
     start_gate = threading.Event()
-    ready = threading.Barrier(3)
+    ready = threading.Barrier(3 if base_enabled else 2)
     latest = None
+    if not base_enabled or fixed_tokens is not None:
+        latest = {
+            "base_id": -1, "tokens": seed_tokens,
+            "past_image": raw["base_image"], "base_start_ns": None,
+        }
     origin_ns = 0
     base_records, edge_records, errors = [], [], []
+    contexts = {}
+    profiled = edge.stage_timer is not None
 
     def fail(exc):
         with condition:
@@ -845,12 +933,16 @@ def run_async_benchmark(
     def base_worker():
         nonlocal latest
         try:
+            if cpu_threads is not None:
+                torch.set_num_threads(cpu_threads)
             with torch.cuda.device(device), torch.cuda.stream(base_stream), torch.no_grad():
                 for _ in range(warmup):
                     if stop.is_set():
                         return
                     run_base(base, raw)
                     base_stream.synchronize()
+                if profiled:
+                    contexts["base"] = execution_context(device)
 
                 ready.wait()
                 start_gate.wait()
@@ -862,16 +954,18 @@ def run_async_benchmark(
                     base_stream.synchronize()
                     finish_ns = time.perf_counter_ns()
 
-                    # Publish only completed tokens with their source image.
-                    packet = {
-                        "base_id": call_id,
-                        "tokens": tokens,
-                        "past_image": base_input["base_image"],
-                        "base_start_ns": start_ns,
-                    }
-                    with condition:
-                        latest = packet
-                        condition.notify_all()
+                    # Normal async execution publishes completed results.
+                    # Controlled diagnostics keep the edge fixture unchanged.
+                    if fixed_tokens is None:
+                        packet = {
+                            "base_id": call_id,
+                            "tokens": tokens,
+                            "past_image": base_input["base_image"],
+                            "base_start_ns": start_ns,
+                        }
+                        with condition:
+                            latest = packet
+                            condition.notify_all()
 
                     base_records.append(
                         call_timing(call_id, start_ns, finish_ns, origin_ns)
@@ -882,6 +976,8 @@ def run_async_benchmark(
 
     def edge_worker():
         try:
+            if cpu_threads is not None:
+                torch.set_num_threads(cpu_threads)
             with torch.cuda.device(device), torch.cuda.stream(edge_stream), torch.no_grad():
                 seed_tokens.record_stream(edge_stream)
                 for _ in range(warmup):
@@ -890,6 +986,8 @@ def run_async_benchmark(
                     deltas = run_edge(edge, raw, seed_tokens)
                     finish_robot_command(deltas, inference)
                     edge_stream.synchronize()
+                if profiled:
+                    contexts["edge"] = execution_context(device)
 
                 ready.wait()
                 start_gate.wait()
@@ -909,10 +1007,12 @@ def run_async_benchmark(
 
                     start_ns = time.perf_counter_ns()
                     deltas = run_edge(edge, edge_input, packet["tokens"])
+                    dispatched_ns = time.perf_counter_ns() if profiled else None
                     edge_stream.synchronize()
                     finish_ns = time.perf_counter_ns()
 
-                    command = finish_robot_command(deltas, inference)
+                    command_profile = {} if profiled else None
+                    command = finish_robot_command(deltas, inference, command_profile)
                     edge_stream.synchronize()
                     command_finish_ns = time.perf_counter_ns()
 
@@ -925,21 +1025,31 @@ def run_async_benchmark(
                         "command_finish_ms": (command_finish_ns - origin_ns) / 1e6,
                         "framework_ms": (command_finish_ns - finish_ns) / 1e6,
                         "edge_to_command_ms": (command_finish_ns - start_ns) / 1e6,
-                        "base_start_to_command_ms": (
-                            command_finish_ns - packet["base_start_ns"]
-                        ) / 1e6,
                         "linear_velocity": float(command[0]),
                         "angular_velocity": float(command[1]),
                     })
+                    if packet["base_start_ns"] is not None:
+                        record["base_start_to_command_ms"] = (
+                            command_finish_ns - packet["base_start_ns"]
+                        ) / 1e6
+                    add_edge_profile(
+                        edge, record,
+                        (finish_ns - dispatched_ns) / 1e6 if profiled else 0.0,
+                        command_profile,
+                    )
                     edge_records.append(record)
                     call_id += 1
+                if profiled:
+                    contexts["edge"]["cpu_cgroup_delta"] = cpu_counter_delta(
+                        contexts["edge"]["cpu_cgroup"], cpu_snapshot(),
+                    )
         except Exception as exc:
             fail(exc)
 
-    workers = [
-        threading.Thread(target=base_worker, name="base"),
-        threading.Thread(target=edge_worker, name="edge"),
-    ]
+    workers = []
+    if base_enabled:
+        workers.append(threading.Thread(target=base_worker, name="base"))
+    workers.append(threading.Thread(target=edge_worker, name="edge"))
     for worker in workers:
         worker.start()
 
@@ -962,11 +1072,17 @@ def run_async_benchmark(
     if errors:
         raise RuntimeError("An asynchronous benchmark worker failed.") from errors[0]
 
-    return {
+    result = {
         "origin_ns": origin_ns,
         "base_calls": base_records,
         "edge_calls": edge_records,
     }
+    if profiled:
+        result["execution_context"] = contexts
+    if fixed_tokens is not None or not base_enabled:
+        result["token_policy"] = "fixed_fixture"
+        result["base_enabled"] = base_enabled
+    return result
 
 
 def save_benchmark_results(name, output_path, metadata, records):
@@ -989,7 +1105,76 @@ def save_benchmark_results(name, output_path, metadata, records):
                 report_samples(
                     f"{name} {field}", records["edge_calls"], field,
                 )
+        profiles = [
+            record["edge_profile"] for record in records["edge_calls"]
+            if "edge_profile" in record
+        ]
+        if profiles:
+            for field in (
+                "cpu_prepare_ms", "cpu_prepare_thread_ms", "h2d_bf16_wall_ms",
+                "shead_dispatch_ms", "completion_wait_ms",
+            ):
+                report_samples(f"{name} {field}", profiles, field)
+            for group in ("cpu_wall_ms", "cpu_thread_ms", "cuda_span_ms"):
+                for stage in profiles[0][group]:
+                    report_samples(
+                        f"{name} {group}.{stage}",
+                        [profile[group] for profile in profiles], stage,
+                    )
+            if records.get("edge_cpu_cgroup_delta"):
+                print(f"{name} edge CPU cgroup counters: "
+                      f"{records['edge_cpu_cgroup_delta']}")
+            elif "execution_context" in records:
+                delta = records["execution_context"].get("edge", {}).get(
+                    "cpu_cgroup_delta", {},
+                )
+                if delta:
+                    print(f"{name} edge CPU cgroup counters: {delta}")
+            command_profiles = [
+                record["command_profile"] for record in records["edge_calls"]
+                if "command_profile" in record
+            ]
+            for stage in command_profiles[0]:
+                report_samples(
+                    f"{name} command.{stage}", command_profiles, stage,
+                )
     print(f"Saved {name} call timings to {output_path}")
+
+
+def compare_edge_diagnostics(results):
+    """Compare matching stage means across the three diagnostic conditions."""
+    names = ("diag_main", "diag_worker", "diag_concurrent")
+    if any(not results[name]["edge_calls"] for name in names):
+        print("Stage comparison requires completed edge calls in all conditions.")
+        return
+    metrics = (
+        ("edge latency", None, "latency_ms"),
+        ("CPU image preparation", "edge_profile", "cpu_prepare_ms"),
+        ("H2D and BF16 host duration", "edge_profile", "h2d_bf16_wall_ms"),
+        ("network host dispatch", "edge_profile", "shead_dispatch_ms"),
+        ("completion wait", "edge_profile", "completion_wait_ms"),
+        ("pair encoder CUDA span", "cuda_span_ms", "pair_encoder"),
+        ("current encoder CUDA span", "cuda_span_ms", "current_encoder"),
+        ("transformer CUDA span", "cuda_span_ms", "transformer"),
+        ("action head CUDA span", "cuda_span_ms", "action_head"),
+    )
+    print("Stage means (ms). CUDA spans overlap host durations.")
+    print(f"{'stage':<30} {'main':>9} {'worker':>9} {'concurrent':>11}"
+          f" {'main-worker':>13} {'worker-concurrent':>18}")
+    for label, group, field in metrics:
+        means = []
+        for name in names:
+            calls = results[name]["edge_calls"]
+            if group is None:
+                values = [call[field] for call in calls]
+            elif group == "edge_profile":
+                values = [call[group][field] for call in calls]
+            else:
+                values = [call["edge_profile"][group][field] for call in calls]
+            means.append(float(np.mean(values)))
+        main, worker, concurrent = means
+        print(f"{label:<30} {main:9.2f} {worker:9.2f} {concurrent:11.2f}"
+              f" {main - worker:13.2f} {worker - concurrent:18.2f}")
 
 
 def report_samples(name, records, field):
@@ -1117,10 +1302,34 @@ if __name__ == "__main__":
         description="Measure isolated and asynchronous AsyncVLA execution."
     )
     parser.add_argument(
-        "--mode", choices=("all", "isolated", "async"), default="all",
-        help="Run both experiments, isolated components only, or asynchronous execution only.",
+        "--mode",
+        choices=("all", "isolated", "async", "edge-worker", "diagnose"),
+        default="all",
+        help="Select isolated, concurrent, or controlled edge diagnostics.",
     )
+    parser.add_argument("--profile-edge", action="store_true",
+                        help="Record CPU stages, CUDA spans, and encoder counts.")
+    parser.add_argument("--gpu-telemetry", action="store_true",
+                        help="Sample GPU clocks and operating state every 250 ms.")
+    parser.add_argument("--repeats", type=int, default=100)
+    parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--duration", type=float, default=30.0,
+                        help="Worker measurement window in seconds, not a frequency.")
+    parser.add_argument("--cpu-threads", type=int, default=None,
+                        help="Optional CPU thread control for a separate diagnostic run.")
+    parser.add_argument("--reverse-order", action="store_true",
+                        help="Reverse the three conditions in diagnose mode.")
     args = parser.parse_args()
+    if (args.repeats <= 0 or args.warmup < 0
+            or not math.isfinite(args.duration) or args.duration <= 0):
+        parser.error("Require repeats > 0, warmup >= 0, and duration > 0.")
+    if args.reverse_order and args.mode != "diagnose":
+        parser.error("--reverse-order requires --mode diagnose.")
+    if args.cpu_threads is not None:
+        if args.cpu_threads <= 0:
+            parser.error("--cpu-threads must be positive.")
+        torch.set_num_threads(args.cpu_threads)
+
 
     # # select modality
     # pose_goal = True
@@ -1177,7 +1386,8 @@ if __name__ == "__main__":
 
     # Reuse the same modules for isolated and asynchronous experiments.
     base = BaseVLM(vla, pose_projector, action_proj, inference, device_id, NUM_PATCHES).eval()
-    edge = EdgeAdaptor(shead, device_id).eval()
+    profile_edge = args.profile_edge or args.mode == "diagnose"
+    edge = EdgeAdaptor(shead, device_id, profile=profile_edge).eval()
 
     metadata = {
         "gpu": torch.cuda.get_device_name(device_id),
@@ -1186,25 +1396,68 @@ if __name__ == "__main__":
         "language_instruction": raw["language"],
         "goal_pose": raw["goal_pose"],
     }
+    experiments = []
+    if args.mode == "diagnose":
+        # Hold the exact edge inputs fixed across all three conditions.
+        fixture = run_base(base, raw)
+        torch.cuda.synchronize(device_id)
+        experiments = [
+            ("diag_main", lambda: run_isolated_benchmark(
+                base, edge, raw, inference, device_id,
+                repeats=args.repeats, warmup=args.warmup, fixed_tokens=fixture,
+            )),
+            ("diag_worker", lambda: run_async_benchmark(
+                base, edge, raw, inference, device_id,
+                duration_s=args.duration, warmup=args.warmup,
+                cpu_threads=args.cpu_threads,
+                base_enabled=False, fixed_tokens=fixture,
+            )),
+            ("diag_concurrent", lambda: run_async_benchmark(
+                base, edge, raw, inference, device_id,
+                duration_s=args.duration, warmup=args.warmup,
+                cpu_threads=args.cpu_threads,
+                base_enabled=True, fixed_tokens=fixture,
+            )),
+        ]
+        if args.reverse_order:
+            experiments.reverse()
+    else:
+        suffix = "_profile" if profile_edge else ""
+        if args.mode in ("all", "isolated"):
+            experiments.append(("isolated" + suffix, lambda: run_isolated_benchmark(
+                base, edge, raw, inference, device_id,
+                repeats=args.repeats, warmup=args.warmup,
+            )))
+        if args.mode == "edge-worker":
+            experiments.append(("edge_worker" + suffix, lambda: run_async_benchmark(
+                base, edge, raw, inference, device_id,
+                duration_s=args.duration, warmup=args.warmup,
+                cpu_threads=args.cpu_threads, base_enabled=False,
+            )))
+        if args.mode in ("all", "async"):
+            experiments.append(("async" + suffix, lambda: run_async_benchmark(
+                base, edge, raw, inference, device_id,
+                duration_s=args.duration, warmup=args.warmup,
+                cpu_threads=args.cpu_threads,
+            )))
 
-    if args.mode in ("all", "isolated"):
-        isolated_records = run_isolated_benchmark(
-            base, edge, raw, inference, device_id,
-            repeats=100,
-            warmup=10,
-        )
-        save_benchmark_results(
-            "isolated", "./inference/baseline_isolated.json",
-            metadata, isolated_records,
-        )
-
-    if args.mode in ("all", "async"):
-        async_records = run_async_benchmark(
-            base, edge, raw, inference, device_id,
-            duration_s=30.0,
-            warmup=10,
-        )
-        save_benchmark_results(
-            "async", "./inference/baseline_async.json",
-            metadata, async_records,
-        )
+    diagnostic_results = {}
+    try:
+        for name, run_experiment in experiments:
+            if profile_edge or args.gpu_telemetry:
+                records = observe_benchmark(
+                    run_experiment, device_id, telemetry=args.gpu_telemetry,
+                )
+            else:
+                records = run_experiment()
+            if args.mode == "diagnose":
+                diagnostic_results[name] = records
+            suffix = "_reverse" if args.mode == "diagnose" and args.reverse_order else ""
+            save_benchmark_results(
+                name, f"./inference/baseline_{name}{suffix}.json", metadata, records,
+            )
+        if args.mode == "diagnose":
+            compare_edge_diagnostics(diagnostic_results)
+    finally:
+        if edge.stage_timer is not None:
+            edge.stage_timer.close()
