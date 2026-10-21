@@ -14,6 +14,8 @@ sys.path.extend([
 ])
 
 import time, math, json
+import threading
+import argparse
 import yaml
 from typing import Optional, Tuple, Type, Dict
 from dataclasses import dataclass
@@ -743,6 +745,253 @@ def measure_e2e(base, edge, raw, inference, device):
     }
 
 
+def call_timing(call_id, start_ns, finish_ns, origin_ns):
+    return {
+        "call_id": call_id,
+        "start_ns": start_ns,
+        "finish_ns": finish_ns,
+        "start_ms": (start_ns - origin_ns) / 1e6,
+        "finish_ms": (finish_ns - origin_ns) / 1e6,
+        "latency_ms": (finish_ns - start_ns) / 1e6,
+    }
+
+
+def run_isolated_benchmark(
+    base, edge, raw, inference, device, repeats=100, warmup=10,
+):
+    if repeats <= 0 or warmup < 0:
+        raise ValueError("repeats must be positive and warmup must be nonnegative.")
+
+    base_records, edge_records = [], []
+    with torch.cuda.device(device), torch.no_grad():
+        for _ in range(warmup):
+            run_base(base, raw)
+        torch.cuda.synchronize(device)
+        origin_ns = time.perf_counter_ns()
+
+        # Only BaseVLM executes during this phase.
+        for call_id in range(repeats):
+            tokens, timing = measure_call(lambda: run_base(base, raw), device)
+            base_records.append(call_timing(
+                call_id, timing["start_ns"], timing["end_ns"], origin_ns,
+            ))
+
+        # Use the last completed base result as a fixed edge input.
+        for _ in range(warmup):
+            deltas = run_edge(edge, raw, tokens)
+            finish_robot_command(deltas, inference)
+        torch.cuda.synchronize(device)
+
+        # BaseVLM stays idle throughout this phase.
+        for call_id in range(repeats):
+            deltas, timing = measure_call(
+                lambda: run_edge(edge, raw, tokens), device,
+            )
+            command = finish_robot_command(deltas, inference)
+            torch.cuda.synchronize(device)
+            command_finish_ns = time.perf_counter_ns()
+            record = call_timing(
+                call_id, timing["start_ns"], timing["end_ns"], origin_ns,
+            )
+            record.update({
+                "base_id": base_records[-1]["call_id"],
+                "command_finish_ns": command_finish_ns,
+                "command_finish_ms": (command_finish_ns - origin_ns) / 1e6,
+                "framework_ms": (command_finish_ns - timing["end_ns"]) / 1e6,
+                "edge_to_command_ms": (
+                    command_finish_ns - timing["start_ns"]
+                ) / 1e6,
+                "linear_velocity": float(command[0]),
+                "angular_velocity": float(command[1]),
+            })
+            edge_records.append(record)
+
+    return {
+        "origin_ns": origin_ns,
+        "base_calls": base_records,
+        "edge_calls": edge_records,
+    }
+
+
+def run_async_benchmark(
+    base, edge, raw, inference, device, duration_s=30.0, warmup=10,
+):
+    if duration_s <= 0 or warmup < 0:
+        raise ValueError("duration_s must be positive and warmup must be nonnegative.")
+
+    # Prepare tokens for edge warmup only.
+    with torch.cuda.device(device), torch.no_grad():
+        seed_tokens = run_base(base, raw)
+        torch.cuda.synchronize(device)
+
+    base_stream = torch.cuda.Stream(device=device)
+    edge_stream = torch.cuda.Stream(device=device)
+    condition = threading.Condition()
+    stop = threading.Event()
+    start_gate = threading.Event()
+    ready = threading.Barrier(3)
+    latest = None
+    origin_ns = 0
+    base_records, edge_records, errors = [], [], []
+
+    def fail(exc):
+        with condition:
+            errors.append(exc)
+            stop.set()
+            condition.notify_all()
+        ready.abort()
+        start_gate.set()
+
+    def base_worker():
+        nonlocal latest
+        try:
+            with torch.cuda.device(device), torch.cuda.stream(base_stream), torch.no_grad():
+                for _ in range(warmup):
+                    if stop.is_set():
+                        return
+                    run_base(base, raw)
+                    base_stream.synchronize()
+
+                ready.wait()
+                start_gate.wait()
+                call_id = 0
+                while not stop.is_set():
+                    base_input = raw.copy()
+                    start_ns = time.perf_counter_ns()
+                    tokens = run_base(base, base_input)
+                    base_stream.synchronize()
+                    finish_ns = time.perf_counter_ns()
+
+                    # Publish only completed tokens with their source image.
+                    packet = {
+                        "base_id": call_id,
+                        "tokens": tokens,
+                        "past_image": base_input["base_image"],
+                        "base_start_ns": start_ns,
+                    }
+                    with condition:
+                        latest = packet
+                        condition.notify_all()
+
+                    base_records.append(
+                        call_timing(call_id, start_ns, finish_ns, origin_ns)
+                    )
+                    call_id += 1
+        except Exception as exc:
+            fail(exc)
+
+    def edge_worker():
+        try:
+            with torch.cuda.device(device), torch.cuda.stream(edge_stream), torch.no_grad():
+                seed_tokens.record_stream(edge_stream)
+                for _ in range(warmup):
+                    if stop.is_set():
+                        return
+                    deltas = run_edge(edge, raw, seed_tokens)
+                    finish_robot_command(deltas, inference)
+                    edge_stream.synchronize()
+
+                ready.wait()
+                start_gate.wait()
+                call_id = 0
+                while not stop.is_set():
+                    with condition:
+                        condition.wait_for(
+                            lambda: latest is not None or stop.is_set()
+                        )
+                        if stop.is_set():
+                            break
+                        packet = latest
+
+                    edge_input = raw.copy()
+                    edge_input["base_image"] = packet["past_image"]
+                    packet["tokens"].record_stream(edge_stream)
+
+                    start_ns = time.perf_counter_ns()
+                    deltas = run_edge(edge, edge_input, packet["tokens"])
+                    edge_stream.synchronize()
+                    finish_ns = time.perf_counter_ns()
+
+                    command = finish_robot_command(deltas, inference)
+                    edge_stream.synchronize()
+                    command_finish_ns = time.perf_counter_ns()
+
+                    record = call_timing(
+                        call_id, start_ns, finish_ns, origin_ns
+                    )
+                    record.update({
+                        "base_id": packet["base_id"],
+                        "command_finish_ns": command_finish_ns,
+                        "command_finish_ms": (command_finish_ns - origin_ns) / 1e6,
+                        "framework_ms": (command_finish_ns - finish_ns) / 1e6,
+                        "edge_to_command_ms": (command_finish_ns - start_ns) / 1e6,
+                        "base_start_to_command_ms": (
+                            command_finish_ns - packet["base_start_ns"]
+                        ) / 1e6,
+                        "linear_velocity": float(command[0]),
+                        "angular_velocity": float(command[1]),
+                    })
+                    edge_records.append(record)
+                    call_id += 1
+        except Exception as exc:
+            fail(exc)
+
+    workers = [
+        threading.Thread(target=base_worker, name="base"),
+        threading.Thread(target=edge_worker, name="edge"),
+    ]
+    for worker in workers:
+        worker.start()
+
+    try:
+        ready.wait()
+        origin_ns = time.perf_counter_ns()
+        start_gate.set()
+        # This bounds experiment duration. It does not pace either worker.
+        stop.wait(duration_s)
+    except threading.BrokenBarrierError:
+        pass
+    finally:
+        stop.set()
+        start_gate.set()
+        with condition:
+            condition.notify_all()
+        for worker in workers:
+            worker.join()
+
+    if errors:
+        raise RuntimeError("An asynchronous benchmark worker failed.") from errors[0]
+
+    return {
+        "origin_ns": origin_ns,
+        "base_calls": base_records,
+        "edge_calls": edge_records,
+    }
+
+
+def save_benchmark_results(name, output_path, metadata, records):
+    with open(output_path, "w") as output_file:
+        json.dump({"metadata": metadata, **records}, output_file, indent=2)
+
+    for component, samples in (
+        ("base", records["base_calls"]),
+        ("edge", records["edge_calls"]),
+    ):
+        print(f"{name} {component}: {len(samples)} completed calls")
+        if samples:
+            report_samples(f"{name} {component}", samples, "latency_ms")
+
+    if records["edge_calls"]:
+        for field in (
+            "framework_ms", "edge_to_command_ms", "base_start_to_command_ms",
+        ):
+            if field in records["edge_calls"][0]:
+                report_samples(
+                    f"{name} {field}", records["edge_calls"], field,
+                )
+    print(f"Saved {name} call timings to {output_path}")
+
+
 def report_samples(name, records, field):
     values = np.asarray([record[field] for record in records])
     print(f"{name}: mean={values.mean():.2f} ms, "
@@ -864,6 +1113,15 @@ def define_model(cfg: InferenceConfig) -> None:
 # Main Entry
 # ===============================================================
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Measure isolated and asynchronous AsyncVLA execution."
+    )
+    parser.add_argument(
+        "--mode", choices=("all", "isolated", "async"), default="all",
+        help="Run both experiments, isolated components only, or asynchronous execution only.",
+    )
+    args = parser.parse_args()
+
     # # select modality
     # pose_goal = True
     # satellite = False
@@ -917,50 +1175,36 @@ if __name__ == "__main__":
     )
     # inference.run()
 
-    # Split the BaseVLM and Edge Adapter for baseline SLO measurement
+    # Reuse the same modules for isolated and asynchronous experiments.
     base = BaseVLM(vla, pose_projector, action_proj, inference, device_id, NUM_PATCHES).eval()
     edge = EdgeAdaptor(shead, device_id).eval()
 
-    warmup, repeats = 10, 100
-    base_records, edge_records, e2e_records = [], [], []
-
-    # Run BaseVLM inference and measure latency
-    for _ in range(warmup):
-        tokens = run_base(base, raw)
-    for _ in range(repeats):
-        tokens, record = measure_call(lambda: run_base(base, raw), device_id)
-        base_records.append(record)
-
-    # Run Edge Adapter inference and measure latency
-    for _ in range(warmup):
-        # repo name the action for robot as delta actions
-        deltas = run_edge(edge, raw, tokens)
-    for _ in range(repeats):
-        deltas, record = measure_call(lambda: run_edge(edge, raw, tokens), device_id)
-        edge_records.append(record)
-
-    # Serial E2E: rerun both modules, then compute the velocity command.
-    for _ in range(warmup):
-        command, _ = measure_e2e(base, edge, raw, inference, device_id)
-    for _ in range(repeats):
-        command, record = measure_e2e(base, edge, raw, inference, device_id)
-        e2e_records.append(record)
-
-    # result
-    results = {
-        "metadata": {
-            "gpu": torch.cuda.get_device_name(device_id),
-            "batch_size": 1, 
-            "dtype": "bfloat16",
-            "language_instruction": raw["language"], 
-            "goal_pose": raw["goal_pose"],
-        },
-        "base_only": base_records, "edge_only": edge_records, "e2e": e2e_records,
+    metadata = {
+        "gpu": torch.cuda.get_device_name(device_id),
+        "batch_size": 1,
+        "dtype": "bfloat16",
+        "language_instruction": raw["language"],
+        "goal_pose": raw["goal_pose"],
     }
-    with open("./inference/baseline_raw_inputs.json", "w") as output_file:
-        json.dump(results, output_file, indent=2)
-    report_samples("isolated base", base_records, "latency_ms")
-    report_samples("isolated edge", edge_records, "latency_ms")
-    for field in ("base_ms", "edge_ms", "framework_ms", "e2e_ms"):
-        report_samples("serial " + field, e2e_records, field)
 
+    if args.mode in ("all", "isolated"):
+        isolated_records = run_isolated_benchmark(
+            base, edge, raw, inference, device_id,
+            repeats=100,
+            warmup=10,
+        )
+        save_benchmark_results(
+            "isolated", "./inference/baseline_isolated.json",
+            metadata, isolated_records,
+        )
+
+    if args.mode in ("all", "async"):
+        async_records = run_async_benchmark(
+            base, edge, raw, inference, device_id,
+            duration_s=30.0,
+            warmup=10,
+        )
+        save_benchmark_results(
+            "async", "./inference/baseline_async.json",
+            metadata, async_records,
+        )
