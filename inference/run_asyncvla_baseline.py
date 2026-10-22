@@ -402,7 +402,7 @@ def define_model():
     processor = AutoProcessor.from_pretrained(checkpoint, trust_remote_code=True)
     vla = AutoModelForVision2Seq.from_pretrained(
         checkpoint, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True,
-    ).to(device)
+    ).to(device=device, dtype=torch.bfloat16)
     vla.vision_backbone.set_num_images_in_input(2)
 
     def load(module, name, bf16=True):
