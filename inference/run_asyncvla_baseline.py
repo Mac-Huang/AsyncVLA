@@ -630,7 +630,7 @@ class BaseVLM(nn.Module):
         self.vla.language_model.config.use_cache = False
 
     @torch.no_grad()
-    def forward(self, raw):
+    def prepare_inputs(self, raw):
         # Rebuild the prompt, tokenize, and transform both images on every call.
         instruction = raw["language"] if raw["modality_id"] in (7, 8) else "xxxx"
         instance = self.io.transform_datatype(
@@ -657,15 +657,26 @@ class BaseVLM(nn.Module):
             [raw["modality_id"]], dtype=torch.bfloat16, device=self.device
         )
 
+        batch["pixel_values"] = batch["pixel_values"].to(torch.bfloat16)
+        batch["goal_pose"] = batch["goal_pose"].to(torch.bfloat16)
+        return batch, modality
+
+    @torch.no_grad()
+    def forward(self, raw):
+        return self.forward_prepared(*self.prepare_inputs(raw))
+
+    @torch.no_grad()
+    def forward_prepared(self, batch, modality):
+        """Run fresh vision and language inference from device-resident inputs."""
         with torch.autocast("cuda", dtype=torch.bfloat16):
             output = self.vla(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
-                pixel_values=batch["pixel_values"].to(torch.bfloat16),
+                pixel_values=batch["pixel_values"],
                 modality_id=modality,
                 labels=batch["labels"],
                 output_hidden_states=True,
-                proprio=batch["goal_pose"].to(torch.bfloat16),
+                proprio=batch["goal_pose"],
                 proprio_projector=self.pose_projector,
                 use_film=False,
                 use_cache=False,
